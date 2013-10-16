@@ -1,0 +1,8 @@
+Для компиляции необходимо удалить ВСЕ комменарии на РУССКОМ языке !!!
+
+mex DPT_Sfunc_1_C.c DPT_Sfunc_1_C_wrapper.c
+
+
+Компиляция для отладки:
+
+mex -g DPT_Sfunc_1_C.c DPT_Sfunc_1_C_wrapper.c
