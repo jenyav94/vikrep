@@ -49,10 +49,10 @@ KinectFusionProcessing::KinectFusionProcessing():
 
     // Define a cubic Kinect Fusion reconstruction volume,
     // with the Kinect at the center of the front face and the volume directly in front of Kinect.
-    m_reconstructionParams.voxelsPerMeter = 256;// 1000mm / 256vpm = ~3.9mm/voxel    
-    m_reconstructionParams.voxelCountX = 512;   // 512 / 256vpm = 2m wide reconstruction
-    m_reconstructionParams.voxelCountY = 384;   // Memory = 512*384*512 * 4bytes per voxel
-    m_reconstructionParams.voxelCountZ = 512;   // This will require a GPU with at least 512MB
+    m_reconstructionParams.voxelsPerMeter = 4;// 1000mm / 256vpm = ~3.9mm/voxel    
+    m_reconstructionParams.voxelCountX = 128;   // 512 / 256vpm = 2m wide reconstruction
+    m_reconstructionParams.voxelCountY = 128;   // Memory = 512*384*512 * 4bytes per voxel
+    m_reconstructionParams.voxelCountZ = 128;   // This will require a GPU with at least 512MB
 
     // These parameters are for optionally clipping the input depth image 
     m_fMinDepthThreshold = NUI_FUSION_DEFAULT_MINIMUM_DEPTH;   // min depth in meters
@@ -133,6 +133,10 @@ void KinectFusionProcessing::Run()
     // Main message loop
     while (stopApp)
     {
+		if(_kbhit()){
+			if(_getch()==27)
+		      stopApp=false;
+		}
 		
         hEvents[0] = m_hNextDepthFrameEvent;
 
@@ -147,6 +151,38 @@ void KinectFusionProcessing::Run()
 
        
     }
+
+	if(!stopApp){
+		
+		 UINT sourceOriginX=0;
+         UINT sourceOriginY=0;
+         UINT sourceOriginZ=0;
+         UINT destinationResolutionX= (int)m_reconstructionParams.voxelCountX;//* m_reconstructionParams.voxelsPerMeter;
+         UINT destinationResolutionY=(int)m_reconstructionParams.voxelCountY;//* m_reconstructionParams.voxelsPerMeter;
+         UINT destinationResolutionZ=(int)m_reconstructionParams.voxelCountZ;//* m_reconstructionParams.voxelsPerMeter;
+         UINT voxelStep=1;
+         UINT cbVolumeBlock=(int)destinationResolutionX*destinationResolutionY*destinationResolutionZ*sizeof(SHORT);
+         SHORT *pVolumeBlock=new SHORT[destinationResolutionX*destinationResolutionY*destinationResolutionZ];
+		 int sizeofMas=(int)destinationResolutionX*destinationResolutionY*destinationResolutionZ;
+
+		 for(int i=0; i<sizeofMas;++i){
+			pVolumeBlock[i]=0;
+		}
+
+
+		 
+	    m_pVolume->ExportVolumeBlock(sourceOriginX,sourceOriginY,sourceOriginZ,destinationResolutionX,destinationResolutionY,destinationResolutionZ,voxelStep,cbVolumeBlock,pVolumeBlock);
+		
+		FILE *file;
+		file=fopen("out.txt","w");
+		cout<<endl<<sizeofMas;
+		for(int i=0; i<sizeofMas;++i){
+		if(pVolumeBlock[i]>0)
+		 fprintf(file,"%d  ",pVolumeBlock[i]);
+		}
+		fclose(file);
+	    delete[] pVolumeBlock;
+	}
 
     
 }

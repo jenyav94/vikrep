@@ -7,7 +7,9 @@ int main(){
 	test->InitializeKinectFusion();
 	test->Run();
 	
+
 	delete test;
+
 	
-	
+	system("pause");
 return 0;}

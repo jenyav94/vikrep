@@ -1,3 +1,5 @@
+  #include <conio.h>
+
 // Safe release for interfaces
 template<class Interface>
 inline void SafeRelease( Interface *& pInterfaceToRelease )
