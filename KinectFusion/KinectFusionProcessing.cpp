@@ -18,14 +18,14 @@ void SetIdentityMatrix(Matrix4 &mat)
 /// Constructor
 /// </summary>
 KinectFusionProcessing::KinectFusionProcessing():
-    stopApp(true),
     m_pVolume(nullptr),
     m_pNuiSensor(nullptr),
     m_depthImageResolution(NUI_IMAGE_RESOLUTION_640x480),
+    m_colorImageResolution(NUI_IMAGE_RESOLUTION_640x480),
     m_cDepthImagePixels(0),
+    m_cColorImagePixels(0),
     m_hNextDepthFrameEvent(INVALID_HANDLE_VALUE),
     m_pDepthStreamHandle(INVALID_HANDLE_VALUE),
-    m_bMirrorDepthFrame(false),
     m_bTranslateResetPoseByMinDepthThreshold(true),
     m_bAutoResetReconstructionWhenLost(false),
     m_bAutoResetReconstructionOnTimeout(true),
@@ -33,9 +33,17 @@ KinectFusionProcessing::KinectFusionProcessing():
     m_bTrackingFailed(false),
     m_cFrameCounter(0),
     m_fStartTime(0),
+    m_cLastDepthFrameTimeStamp(0),
+    m_cLastColorFrameTimeStamp(0),
     m_pDepthImagePixelBuffer(nullptr),
+    m_pColorCoordinates(nullptr),
+    m_pMapper(nullptr),
     m_pDepthFloatImage(nullptr),
-    m_bInitializeError(false)
+    m_pColorImage(nullptr),
+    m_pResampledColorImageDepthAligned(nullptr),
+    m_bInitializeError(false),
+    m_bCaptureColor(true),
+    m_cColorIntegrationInterval(2)  // Capturing color has an associated processing cost, so we do not capture every frame here
 {
 	// Get the depth frame size from the NUI_IMAGE_RESOLUTION enum
     // You can use NUI_IMAGE_RESOLUTION_640x480 or NUI_IMAGE_RESOLUTION_320x240 in this sample
@@ -46,7 +54,12 @@ KinectFusionProcessing::KinectFusionProcessing():
     m_cDepthHeight = height;
     m_cDepthImagePixels = m_cDepthWidth*m_cDepthHeight;
 
+	NuiImageResolutionToSize(m_colorImageResolution, width, height);
+    m_cColorWidth  = width;
+    m_cColorHeight = height;
+    m_cColorImagePixels = m_cColorWidth*m_cColorHeight;
 
+   
     // Define a cubic Kinect Fusion reconstruction volume,
     // with the Kinect at the center of the front face and the volume directly in front of Kinect.
     m_reconstructionParams.voxelsPerMeter = 4;// 1000mm / 256vpm = ~3.9mm/voxel    
@@ -77,7 +90,7 @@ KinectFusionProcessing::KinectFusionProcessing():
     SetIdentityMatrix(m_worldToCameraTransform);
     SetIdentityMatrix(m_defaultWorldToVolumeTransform);
 
-    m_cLastDepthFrameTimeStamp.QuadPart = 0;
+   
 }
 
 /// <summary>
@@ -86,17 +99,14 @@ KinectFusionProcessing::KinectFusionProcessing():
 KinectFusionProcessing::~KinectFusionProcessing()
 {
 
-	/*INuiFusionColorMesh *mesh = nullptr;
-    HRESULT hr = m_processor.CalculateMesh(&mesh);
-	if (m_pVolume != nullptr)
-    {
-        hr = m_pVolume->CalculateMesh(1, ppMesh);
-	}*/
 	
 	// Clean up Kinect Fusion
     SafeRelease(m_pVolume);
+	SafeRelease(m_pMapper);
 
     SAFE_FUSION_RELEASE_IMAGE_FRAME(m_pDepthFloatImage);
+	SAFE_FUSION_RELEASE_IMAGE_FRAME(m_pColorImage);
+    SAFE_FUSION_RELEASE_IMAGE_FRAME(m_pResampledColorImageDepthAligned);
 
     // Clean up Kinect
     if (m_pNuiSensor)
@@ -110,17 +120,190 @@ KinectFusionProcessing::~KinectFusionProcessing()
         CloseHandle(m_hNextDepthFrameEvent);
     }
 
+	 if (m_hNextColorFrameEvent != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(m_hNextColorFrameEvent);
+    }
+
+
     // clean up the depth pixel array
-   // SAFE_DELETE_ARRAY(m_pDepthImagePixelBuffer);
+   SAFE_DELETE_ARRAY(m_pDepthImagePixelBuffer);
+
+    // Clean up the color pixel arrays
+    SAFE_DELETE_ARRAY(m_pColorCoordinates);
 
     // clean up Direct2D renderer
-  //  SAFE_DELETE(m_pDrawDepth);
+  //SAFE_DELETE(m_pDrawDepth);
 
     // done with depth pixel data
-  //  SAFE_DELETE_ARRAY(m_pDepthRGBX);
+   // SAFE_DELETE_ARRAY(m_pDepthRGBX);
 
     // clean up Direct2D
   //  SafeRelease(m_pD2DFactory);
+}
+
+HRESULT WriteAsciiPlyMeshFile(INuiFusionColorMesh *mesh, bool flipYZ, bool outputColor)
+{
+    HRESULT hr = S_OK;
+
+    if (NULL == mesh)
+    {
+        return E_INVALIDARG;
+    }
+
+    unsigned int numVertices = mesh->VertexCount();
+    unsigned int numTriangleIndices = mesh->TriangleVertexIndexCount();
+    unsigned int numTriangles = numVertices / 3;
+    unsigned int numColors = mesh->ColorCount();
+
+    if (0 == numVertices || 0 == numTriangleIndices || 0 != numVertices % 3 
+        || numVertices != numTriangleIndices  || (outputColor && numVertices != numColors))
+    {
+        return E_INVALIDARG;
+    }
+
+    const Vector3 *vertices = NULL;
+    hr = mesh->GetVertices(&vertices);
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    const int *triangleIndices = NULL;
+    hr = mesh->GetTriangleIndices(&triangleIndices);
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    const int *colors = NULL;
+    if (outputColor)
+    {
+        hr = mesh->GetColors(&colors);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+    }
+
+    // Open File
+    
+    
+    FILE *meshFile = NULL;
+    errno_t err = fopen_s(&meshFile, "MeshedReconstruction.ply", "wt");
+
+    // Could not open file for writing - return
+    if (0 != err || NULL == meshFile)
+    {
+        return E_ACCESSDENIED;
+    }
+
+    // Write the header line
+    std::string header = "ply\nformat ascii 1.0\ncomment file created by Microsoft Kinect Fusion\n";
+    fwrite(header.c_str(), sizeof(char), header.length(), meshFile);
+
+    const unsigned int bufSize = MAX_PATH*3;
+    char outStr[bufSize];
+    int written = 0;
+
+    if (outputColor)
+    {
+        // Elements are: x,y,z, r,g,b
+        written = sprintf_s(outStr, bufSize, "element vertex %u\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\n", numVertices);
+        fwrite(outStr, sizeof(char), written, meshFile);
+    }
+    else
+    {
+        // Elements are: x,y,z
+        written = sprintf_s(outStr, bufSize, "element vertex %u\nproperty float x\nproperty float y\nproperty float z\n", numVertices);
+        fwrite(outStr, sizeof(char), written, meshFile);
+    }
+
+    written = sprintf_s(outStr, bufSize, "element face %u\nproperty list uchar int vertex_index\nend_header\n", numTriangles);
+    fwrite(outStr, sizeof(char), written, meshFile);
+
+    if (flipYZ)
+    {
+        if (outputColor)
+        {
+            // Sequentially write the 3 vertices of the triangle, for each triangle
+            for (unsigned int t=0, vertexIndex=0; t < numTriangles; ++t, vertexIndex += 3)
+            {
+                unsigned int color0 = colors[vertexIndex];
+                unsigned int color1 = colors[vertexIndex+1];
+                unsigned int color2 = colors[vertexIndex+2];
+
+                written = sprintf_s(outStr, bufSize, "%f %f %f %u %u %u\n%f %f %f %u %u %u\n%f %f %f %u %u %u\n", 
+                    vertices[vertexIndex].x, -vertices[vertexIndex].y, -vertices[vertexIndex].z, 
+                    ((color0 >> 16) & 255), ((color0 >> 8) & 255), (color0 & 255), 
+                    vertices[vertexIndex+1].x, -vertices[vertexIndex+1].y, -vertices[vertexIndex+1].z,
+                    ((color1 >> 16) & 255), ((color1 >> 8) & 255), (color1 & 255), 
+                    vertices[vertexIndex+2].x, -vertices[vertexIndex+2].y, -vertices[vertexIndex+2].z,
+                    ((color2 >> 16) & 255), ((color2 >> 8) & 255), (color2 & 255));
+
+                fwrite(outStr, sizeof(char), written, meshFile);
+            }
+        }
+        else
+        {
+            // Sequentially write the 3 vertices of the triangle, for each triangle
+            for (unsigned int t=0, vertexIndex=0; t < numTriangles; ++t, vertexIndex += 3)
+            {
+                written = sprintf_s(outStr, bufSize, "%f %f %f\n%f %f %f\n%f %f %f\n", 
+                    vertices[vertexIndex].x, -vertices[vertexIndex].y, -vertices[vertexIndex].z, 
+                    vertices[vertexIndex+1].x, -vertices[vertexIndex+1].y, -vertices[vertexIndex+1].z, 
+                    vertices[vertexIndex+2].x, -vertices[vertexIndex+2].y, -vertices[vertexIndex+2].z);
+                fwrite(outStr, sizeof(char), written, meshFile);
+            }
+        }
+    }
+    else
+    {
+        if (outputColor)
+        {
+            // Sequentially write the 3 vertices of the triangle, for each triangle
+            for (unsigned int t=0, vertexIndex=0; t < numTriangles; ++t, vertexIndex += 3)
+            {
+                unsigned int color0 = colors[vertexIndex];
+                unsigned int color1 = colors[vertexIndex+1];
+                unsigned int color2 = colors[vertexIndex+2];
+
+                written = sprintf_s(outStr, bufSize, "%f %f %f %u %u %u\n%f %f %f %u %u %u\n%f %f %f %u %u %u\n", 
+                    vertices[vertexIndex].x, vertices[vertexIndex].y, vertices[vertexIndex].z, 
+                    ((color0 >> 16) & 255), ((color0 >> 8) & 255), (color0 & 255), 
+                    vertices[vertexIndex+1].x, vertices[vertexIndex+1].y, vertices[vertexIndex+1].z,
+                    ((color1 >> 16) & 255), ((color1 >> 8) & 255), (color1 & 255), 
+                    vertices[vertexIndex+2].x, vertices[vertexIndex+2].y, vertices[vertexIndex+2].z,
+                    ((color2 >> 16) & 255), ((color2 >> 8) & 255), (color2 & 255));
+
+                fwrite(outStr, sizeof(char), written, meshFile);
+            }
+        }
+        else
+        {
+            // Sequentially write the 3 vertices of the triangle, for each triangle
+            for (unsigned int t=0, vertexIndex=0; t < numTriangles; ++t, vertexIndex += 3)
+            {
+                written = sprintf_s(outStr, bufSize, "%f %f %f\n%f %f %f\n%f %f %f\n", 
+                    vertices[vertexIndex].x, vertices[vertexIndex].y, vertices[vertexIndex].z, 
+                    vertices[vertexIndex+1].x, vertices[vertexIndex+1].y, vertices[vertexIndex+1].z,
+                    vertices[vertexIndex+2].x, vertices[vertexIndex+2].y, vertices[vertexIndex+2].z);
+                fwrite(outStr, sizeof(char), written, meshFile);
+            }
+        }
+    }
+
+    // Sequentially write the 3 vertex indices of the triangle face, for each triangle (0-referenced in PLY)
+    for (unsigned int t=0, baseIndex=0; t < numTriangles; ++t, baseIndex += 3)
+    {
+        written = sprintf_s(outStr, bufSize, "3 %u %u %u\n", baseIndex, baseIndex+1, baseIndex+2);
+        fwrite(outStr, sizeof(char), written, meshFile);
+    }
+
+    fflush(meshFile);
+    fclose(meshFile);
+
+    return hr;
 }
 
 void KinectFusionProcessing::Run()
@@ -153,35 +336,26 @@ void KinectFusionProcessing::Run()
     }
 
 	if(!stopApp){
+		HRESULT hr;
+		INuiFusionColorMesh *mesh = nullptr;
 		
-		 UINT sourceOriginX=0;
-         UINT sourceOriginY=0;
-         UINT sourceOriginZ=0;
-         UINT destinationResolutionX= (int)m_reconstructionParams.voxelCountX;//* m_reconstructionParams.voxelsPerMeter;
-         UINT destinationResolutionY=(int)m_reconstructionParams.voxelCountY;//* m_reconstructionParams.voxelsPerMeter;
-         UINT destinationResolutionZ=(int)m_reconstructionParams.voxelCountZ;//* m_reconstructionParams.voxelsPerMeter;
-         UINT voxelStep=1;
-         UINT cbVolumeBlock=(int)destinationResolutionX*destinationResolutionY*destinationResolutionZ*sizeof(SHORT);
-         SHORT *pVolumeBlock=new SHORT[destinationResolutionX*destinationResolutionY*destinationResolutionZ];
-		 int sizeofMas=(int)destinationResolutionX*destinationResolutionY*destinationResolutionZ;
+		
+		 if (m_pVolume != nullptr)
+      {
+         hr = m_pVolume->CalculateMesh(1, &mesh);
 
-		 for(int i=0; i<sizeofMas;++i){
-			pVolumeBlock[i]=0;
+         // Set the frame counter to 0 to prevent a reset reconstruction call due to large frame 
+         // timestamp change after meshing. Also reset frame time for fps counter.
+         m_cFrameCounter = 0;
+         //m_fFrameCounterStartTime =  m_timer.AbsoluteTime();
+      }
+
+		  if (SUCCEEDED(hr))
+        {
+            // Save mesh
+            hr =WriteAsciiPlyMeshFile(mesh, true, true);
 		}
 
-
-		 
-	    m_pVolume->ExportVolumeBlock(sourceOriginX,sourceOriginY,sourceOriginZ,destinationResolutionX,destinationResolutionY,destinationResolutionZ,voxelStep,cbVolumeBlock,pVolumeBlock);
-		
-		FILE *file;
-		file=fopen("out.txt","w");
-		cout<<endl<<sizeofMas;
-		for(int i=0; i<sizeofMas;++i){
-		if(pVolumeBlock[i]>0)
-		 fprintf(file,"%d  ",pVolumeBlock[i]);
-		}
-		fclose(file);
-	    delete[] pVolumeBlock;
 	}
 
     
@@ -247,7 +421,7 @@ HRESULT KinectFusionProcessing::CreateFirstConnected()
     if (nullptr != m_pNuiSensor)
     {
         // Initialize the Kinect and specify that we'll be using depth
-        hr = m_pNuiSensor->NuiInitialize(NUI_INITIALIZE_FLAG_USES_DEPTH); 
+        hr = m_pNuiSensor->NuiInitialize(NUI_INITIALIZE_FLAG_USES_DEPTH  | NUI_INITIALIZE_FLAG_USES_COLOR); 
         if (SUCCEEDED(hr))
         {
             // Create an event that will be signaled when depth data is available
@@ -261,10 +435,28 @@ HRESULT KinectFusionProcessing::CreateFirstConnected()
                 2,
                 m_hNextDepthFrameEvent,
                 &m_pDepthStreamHandle);
+
+			 if (SUCCEEDED(hr))
+            {
+                // Open a color image stream to receive color frames
+                hr = m_pNuiSensor->NuiImageStreamOpen(
+                    NUI_IMAGE_TYPE_COLOR,
+                    m_colorImageResolution,
+                    0,
+                    2,
+                    m_hNextColorFrameEvent,
+                    &m_pColorStreamHandle);
+            }
+
+            if (SUCCEEDED(hr))
+            {
+                // Create the coordinate mapper for converting color to depth space
+                hr = m_pNuiSensor->NuiGetCoordinateMapper(&m_pMapper);
+            }
         }
 
-       
     }
+
 
     if (nullptr == m_pNuiSensor || FAILED(hr))
     {
@@ -319,7 +511,7 @@ HRESULT KinectFusionProcessing::InitializeKinectFusion()
     }
 
     // Create the Kinect Fusion Reconstruction Volume
-    hr = NuiFusionCreateReconstruction(
+    hr = NuiFusionCreateColorReconstruction(
         &m_reconstructionParams,
         m_processorType, m_deviceIndex,
         &m_worldToCameraTransform,
@@ -381,13 +573,40 @@ HRESULT KinectFusionProcessing::InitializeKinectFusion()
         return hr;
     }
 
-    
+	 // Frames generated from the color input
+    hr = NuiFusionCreateImageFrame(NUI_FUSION_IMAGE_TYPE_COLOR, m_cColorWidth, m_cColorHeight, nullptr, &m_pColorImage);
+    if (FAILED(hr))
+    {
+		system("cls");
+        cout<<"Failed to initialize Kinect Fusion image."<<endl;
+        return hr;
+    }
 
+    // Frames generated from the color input aligned to depth - same size as depth
+    hr = NuiFusionCreateImageFrame(NUI_FUSION_IMAGE_TYPE_COLOR, m_cDepthWidth, m_cDepthHeight, nullptr, &m_pResampledColorImageDepthAligned);
+    if (FAILED(hr))
+    {
+		system("cls");
+        cout<<"Failed to initialize Kinect Fusion image."<<endl;
+        return hr;
+    }
+
+    
+	// Depth pixel array to capture data from Kinect sensor
     m_pDepthImagePixelBuffer = new(std::nothrow) NUI_DEPTH_IMAGE_PIXEL[m_cDepthImagePixels];
     if (nullptr == m_pDepthImagePixelBuffer)
     {
 		system("cls");
         cout<<"Failed to initialize Kinect Fusion depth image pixel buffer."<<endl;
+        return hr;
+    }
+
+	 // Setup color coordinate image for depth to color mapping - this must be the same size as the depth
+    m_pColorCoordinates = new(std::nothrow) NUI_COLOR_IMAGE_POINT[m_cDepthImagePixels];
+    if (nullptr == m_pColorCoordinates)
+    {
+		system("cls");
+        cout<<"Failed to initialize Kinect Fusion color image pixel buffer."<<endl;
         return hr;
     }
 
@@ -455,6 +674,242 @@ HRESULT KinectFusionProcessing::CopyExtendedDepth(NUI_IMAGE_FRAME &imageFrame)
 
 
 /// <summary>
+/// Get Color data
+/// </summary>
+/// <param name="imageFrame">The color image frame to copy.</param>
+/// <returns>S_OK on success, otherwise failure code</returns>
+HRESULT KinectFusionProcessing::CopyColor(NUI_IMAGE_FRAME &imageFrame)
+{
+    HRESULT hr = S_OK;
+
+    if (nullptr == m_pColorImage)
+    {
+		system("cls");
+        cout<<"Error copying color texture pixels."<<endl;
+        return E_FAIL;
+    }
+
+    INuiFrameTexture *srcColorTex = imageFrame.pFrameTexture;
+    INuiFrameTexture *destColorTex = m_pColorImage->pFrameTexture;
+
+    if (nullptr == srcColorTex || nullptr == destColorTex)
+    {
+        return E_NOINTERFACE;
+    }
+
+    // Lock the frame data to access the color pixels
+    NUI_LOCKED_RECT srcLockedRect;
+
+    hr = srcColorTex->LockRect(0, &srcLockedRect, nullptr, 0);
+
+    if (FAILED(hr) || srcLockedRect.Pitch == 0)
+    {
+		system("cls");
+        cout<<"Error getting color texture pixels."<<endl;
+        return E_NOINTERFACE;
+    }
+
+    // Lock the frame data to access the color pixels
+    NUI_LOCKED_RECT destLockedRect;
+
+    hr = destColorTex->LockRect(0, &destLockedRect, nullptr, 0);
+
+    if (FAILED(hr) || destLockedRect.Pitch == 0)
+    {
+        srcColorTex->UnlockRect(0);
+		system("cls");
+        cout<<"Error copying color texture pixels."<<endl;
+        return E_NOINTERFACE;
+    }
+
+    // Copy the color pixels so we can return the image frame
+    errno_t err = memcpy_s(
+        destLockedRect.pBits, 
+        m_cColorImagePixels * cBytesPerPixel,
+        srcLockedRect.pBits,
+        srcLockedRect.size);
+
+    srcColorTex->UnlockRect(0);
+    destColorTex->UnlockRect(0);
+
+    if (0 != err)
+    {
+		system("cls");
+        cout<<"Error copying color texture pixels."<<endl;
+        hr = E_FAIL;
+    }
+
+    return hr;
+}
+
+/// <summary>
+/// Process color data received from Kinect
+/// </summary>
+/// <returns>S_OK for success, or failure code</returns>
+HRESULT KinectFusionProcessing::MapColorToDepth()
+{
+    HRESULT hr;
+
+    if (nullptr == m_pColorImage || nullptr == m_pResampledColorImageDepthAligned 
+        || nullptr == m_pDepthImagePixelBuffer || nullptr == m_pColorCoordinates)
+    {
+        return E_FAIL;
+    }
+
+    INuiFrameTexture *srcColorTex = m_pColorImage->pFrameTexture;
+    INuiFrameTexture *destColorTex = m_pResampledColorImageDepthAligned->pFrameTexture;
+
+    if (nullptr == srcColorTex || nullptr == destColorTex)
+    {
+		system("cls");
+        cout<<"Error accessing color textures."<<endl;
+        return E_NOINTERFACE;
+    }
+
+    // Lock the source color frame
+    NUI_LOCKED_RECT srcLockedRect;
+
+    // Lock the frame data to access the color pixels
+    hr = srcColorTex->LockRect(0, &srcLockedRect, nullptr, 0);
+
+    if (FAILED(hr) || srcLockedRect.Pitch == 0)
+    {
+		system("cls");
+        cout<<"Error accessing color texture pixels."<<endl;
+        return  E_FAIL;
+    }
+
+    // Lock the destination color frame
+    NUI_LOCKED_RECT destLockedRect;
+
+    // Lock the frame data to access the color pixels
+    hr = destColorTex->LockRect(0, &destLockedRect, nullptr, 0);
+
+    if (FAILED(hr) || destLockedRect.Pitch == 0)
+    {
+        srcColorTex->UnlockRect(0);
+		system("cls");
+        cout<<"Error accessing color texture pixels."<<endl;
+        return  E_FAIL;
+    }
+
+    int *rawColorData = reinterpret_cast<int*>(srcLockedRect.pBits);
+    int *colorDataInDepthFrame = reinterpret_cast<int*>(destLockedRect.pBits);
+
+    // Get the coordinates to convert color to depth space
+    hr = m_pMapper->MapDepthFrameToColorFrame(
+        m_depthImageResolution, 
+        m_cDepthImagePixels, 
+        m_pDepthImagePixelBuffer, 
+        NUI_IMAGE_TYPE_COLOR, 
+        m_colorImageResolution, 
+        m_cDepthImagePixels,   // the color coordinates that get set are the same array size as the depth image
+        m_pColorCoordinates);
+
+    if (FAILED(hr))
+    {
+        srcColorTex->UnlockRect(0);
+        destColorTex->UnlockRect(0);
+        return hr;
+    }
+
+    // Loop over each row and column of the destination color image and copy from the source image
+    // Note that we could also do this the other way, and convert the depth pixels into the color space, 
+    // avoiding black areas in the converted color image and repeated color images in the background.
+    // However, then the depth would have radial and tangential distortion like the color camera image,
+    // which is not ideal for Kinect Fusion reconstruction.
+    Concurrency::parallel_for(0, static_cast<int>(m_cDepthHeight), [&](int y)
+    {
+        // Horizontal flip the color image as the standard depth image is flipped internally in Kinect Fusion
+        // to give a viewpoint as though from behind the Kinect looking forward by default.
+        unsigned int destIndex = y * m_cDepthWidth;
+        unsigned int flippedDestIndex = destIndex + (m_cDepthWidth-1);
+
+        for (int x = 0; x < m_cDepthWidth; ++x, ++destIndex, --flippedDestIndex)
+        {
+            // Calculate index into depth array
+            int colorInDepthX = m_pColorCoordinates[destIndex].x;
+            int colorInDepthY = m_pColorCoordinates[destIndex].y;
+
+            // Make sure the depth pixel maps to a valid point in color space
+            // Depth and color images are the same size in this sample, so we use the depth image size here.
+            // For a more flexible version, see the KinectFusionExplorer-D2D sample.
+            if ( colorInDepthX >= 0 && colorInDepthX < m_cColorWidth 
+                && colorInDepthY >= 0 && colorInDepthY < m_cColorHeight 
+                && m_pDepthImagePixelBuffer[destIndex].depth != 0)
+            {
+                // Calculate index into color array- this will perform a horizontal flip as well
+                unsigned int sourceColorIndex = colorInDepthX + (colorInDepthY * m_cColorWidth);
+
+                // Copy color pixel
+                colorDataInDepthFrame[flippedDestIndex] = rawColorData[sourceColorIndex];
+            }
+            else
+            {
+                colorDataInDepthFrame[flippedDestIndex] = 0;
+            }
+        }
+    });
+
+    srcColorTex->UnlockRect(0);
+    destColorTex->UnlockRect(0);
+
+    return hr;
+}
+
+
+/// <summary>
+/// Perform only depth conversion and camera tracking
+/// </summary>
+HRESULT KinectFusionProcessing::CameraTrackingOnly()
+{
+    // Convert the pixels describing extended depth as unsigned short type in millimeters to depth
+    // as floating point type in meters.
+    HRESULT hr = m_pVolume->DepthToDepthFloatFrame(m_pDepthImagePixelBuffer, m_cDepthImagePixels * sizeof(NUI_DEPTH_IMAGE_PIXEL), m_pDepthFloatImage, m_fMinDepthThreshold, m_fMaxDepthThreshold, m_bMirrorDepthFrame);
+
+    if (FAILED(hr))
+    {
+		system("cls");
+        cout<<"Kinect Fusion NuiFusionDepthToDepthFloatFrame call failed."<<endl;
+        return hr;
+    }
+
+    HRESULT tracking = m_pVolume->AlignDepthFloatToReconstruction(
+        m_pDepthFloatImage,
+        NUI_FUSION_DEFAULT_ALIGN_ITERATION_COUNT,
+        nullptr,
+        nullptr,
+        nullptr);
+
+    if (FAILED(tracking))
+    {
+        m_cLostFrameCounter++;
+        m_bTrackingFailed = true;
+
+        if (tracking == E_NUI_FUSION_TRACKING_ERROR)
+        {
+                system("cls");
+                cout<<"Kinect Fusion camera tracking failed! Align the camera to the last tracked position."<<endl;
+        }
+        else
+        {
+			system("cls");
+            cout<<"Kinect Fusion AlignDepthFloatToReconstruction call failed!"<<endl;
+            hr = tracking;
+        }
+    }
+    else
+    {
+        m_pVolume->GetCurrentWorldToCameraTransform(&m_worldToCameraTransform);
+        m_cLostFrameCounter = 0;
+        m_bTrackingFailed = false;
+    }
+
+    return hr;
+}
+
+
+/// <summary>
 /// Handle new depth data and perform Kinect Fusion processing
 /// </summary>
 void KinectFusionProcessing::ProcessDepth()
@@ -466,6 +921,7 @@ void KinectFusionProcessing::ProcessDepth()
 
     HRESULT hr = S_OK;
     NUI_IMAGE_FRAME imageFrame;
+    bool integrateColor = m_bCaptureColor && m_cFrameCounter % m_cColorIntegrationInterval == 0;
 
     ////////////////////////////////////////////////////////
     // Get an extended depth frame from Kinect
@@ -480,7 +936,7 @@ void KinectFusionProcessing::ProcessDepth()
 
     hr = CopyExtendedDepth(imageFrame);
 
-    LARGE_INTEGER currentDepthFrameTime = imageFrame.liTimeStamp;
+    LONGLONG currentDepthFrameTime = imageFrame.liTimeStamp.QuadPart;
 
     // Release the Kinect camera frame
     m_pNuiSensor->NuiImageStreamReleaseFrame(m_pDepthStreamHandle, &imageFrame);
@@ -490,13 +946,110 @@ void KinectFusionProcessing::ProcessDepth()
         return;
     }
 
+	 ////////////////////////////////////////////////////////
+    // Get a color frame from Kinect
+
+    LONGLONG currentColorFrameTime = m_cLastColorFrameTimeStamp;
+
+    hr = m_pNuiSensor->NuiImageStreamGetNextFrame(m_pColorStreamHandle, 0, &imageFrame);
+    if (FAILED(hr))
+    {
+        integrateColor = false;
+    }
+    else
+    {
+        hr = CopyColor(imageFrame);
+
+        currentColorFrameTime = imageFrame.liTimeStamp.QuadPart;
+
+        // Release the Kinect camera frame
+        m_pNuiSensor->NuiImageStreamReleaseFrame(m_pColorStreamHandle, &imageFrame);
+
+        if (FAILED(hr))
+        {
+            return;
+        }
+    }
+
+    // Check color and depth frame timestamps to ensure they were captured at the same time
+    // If not, we attempt to re-synchronize by getting a new frame from the stream that is behind.
+    int timestampDiff = static_cast<int>(abs(currentColorFrameTime - currentDepthFrameTime));
+
+    if (integrateColor && timestampDiff >= cMinTimestampDifferenceForFrameReSync)
+    {
+        // Get another frame to try and re-sync
+        if (currentColorFrameTime - currentDepthFrameTime >= cMinTimestampDifferenceForFrameReSync)
+        {
+            // Perform camera tracking only from this current depth frame
+            if (m_cFrameCounter > 0)
+            {
+                CameraTrackingOnly();
+            }
+
+            // Get another depth frame to try and re-sync as color ahead of depth
+            hr = m_pNuiSensor->NuiImageStreamGetNextFrame(m_pDepthStreamHandle, timestampDiff, &imageFrame);
+            if (FAILED(hr))
+            {
+                // Return, having performed camera tracking on the current depth frame
+                return;
+            }
+
+            hr = CopyExtendedDepth(imageFrame);
+
+            currentDepthFrameTime = imageFrame.liTimeStamp.QuadPart;
+
+            // Release the Kinect camera frame
+            m_pNuiSensor->NuiImageStreamReleaseFrame(m_pDepthStreamHandle, &imageFrame);
+
+            if (FAILED(hr))
+            {
+				system("cls");
+                cout<<"Kinect Depth stream NuiImageStreamReleaseFrame call failed."<<endl;
+                return;
+            }
+        }
+        else if (currentDepthFrameTime - currentColorFrameTime >= cMinTimestampDifferenceForFrameReSync && WaitForSingleObject(m_hNextColorFrameEvent, 0) != WAIT_TIMEOUT)
+        {
+            // Get another color frame to try and re-sync as depth ahead of color
+            hr = m_pNuiSensor->NuiImageStreamGetNextFrame(m_pColorStreamHandle, 0, &imageFrame);
+            if (FAILED(hr))
+            {
+                integrateColor = false;
+            }
+            else
+            {
+                hr = CopyColor(imageFrame);
+
+                currentColorFrameTime = imageFrame.liTimeStamp.QuadPart;
+
+                // Release the Kinect camera frame
+                m_pNuiSensor->NuiImageStreamReleaseFrame(m_pColorStreamHandle, &imageFrame);
+
+                if (FAILED(hr))
+                {
+					system("cls");
+                    cout<<"Kinect Color stream NuiImageStreamReleaseFrame call failed."<<endl;
+                    integrateColor = false;
+                }
+            }
+        }
+
+        timestampDiff = static_cast<int>(abs(currentColorFrameTime - currentDepthFrameTime));
+
+        // If the difference is still too large, we do not want to integrate color
+        if (timestampDiff > cMinTimestampDifferenceForFrameReSync)
+        {
+            integrateColor = false;
+        }
+    }
+
     // To enable playback of a .xed file through Kinect Studio and reset of the reconstruction
     // if the .xed loops, we test for when the frame timestamp has skipped a large number. 
     // Note: this will potentially continually reset live reconstructions on slow machines which
     // cannot process a live frame in less time than the reset threshold. Increase the number of
     // milliseconds in cResetOnTimeStampSkippedMilliseconds if this is a problem.
     if (m_bAutoResetReconstructionOnTimeout && m_cFrameCounter != 0 
-        && abs(currentDepthFrameTime.QuadPart - m_cLastDepthFrameTimeStamp.QuadPart) > cResetOnTimeStampSkippedMilliseconds)
+        && abs(currentDepthFrameTime - m_cLastDepthFrameTimeStamp) > cResetOnTimeStampSkippedMilliseconds)
     {
         ResetReconstruction();
 
@@ -507,6 +1060,7 @@ void KinectFusionProcessing::ProcessDepth()
     }
 
     m_cLastDepthFrameTimeStamp = currentDepthFrameTime;
+	m_cLastColorFrameTimeStamp = currentColorFrameTime;
 
     // Return if the volume is not initialized
     if (nullptr == m_pVolume)
@@ -533,11 +1087,23 @@ void KinectFusionProcessing::ProcessDepth()
     ////////////////////////////////////////////////////////
     // ProcessFrame
 
+	if (integrateColor)
+    {
+        // Map the color frame to the depth
+        MapColorToDepth();
+    }
+
     // Perform the camera tracking and update the Kinect Fusion Volume
     // This will create memory on the GPU, upload the image, run camera tracking and integrate the
     // data into the Reconstruction Volume if successful. Note that passing nullptr as the final 
     // parameter will use and update the internal camera pose.
-    hr = m_pVolume->ProcessFrame(m_pDepthFloatImage, NUI_FUSION_DEFAULT_ALIGN_ITERATION_COUNT, m_cMaxIntegrationWeight, &m_worldToCameraTransform);
+   hr = m_pVolume->ProcessFrame(
+        m_pDepthFloatImage, 
+        integrateColor ? m_pResampledColorImageDepthAligned : nullptr,
+        NUI_FUSION_DEFAULT_ALIGN_ITERATION_COUNT, 
+        m_cMaxIntegrationWeight, 
+        NUI_FUSION_DEFAULT_COLOR_INTEGRATION_OF_ALL_ANGLES,
+        &m_worldToCameraTransform);
 
     // Test to see if camera tracking failed. 
     // If it did fail, no data integration or raycast for reference points and normals will have taken 
@@ -669,101 +1235,3 @@ HRESULT KinectFusionProcessing::ResetReconstruction()
     return hr;
 }
 
-/// <summary>
-/// Save Mesh to disk.
-/// </summary>
-/// <param name="mesh">The mesh to save.</param>
-/// <returns>indicates success or failure</returns>
-/*HRESULT KinectFusionProcessing::SaveMeshFile(INuiFusionColorMesh* pMesh)
-{
-    HRESULT hr = S_OK;
-
-    if (nullptr == pMesh)
-    {
-        return E_INVALIDARG;
-    }
-
-    CComPtr<IFileSaveDialog> pSaveDlg;
-
-    // Create the file save dialog object.
-    hr = pSaveDlg.CoCreateInstance(__uuidof(FileSaveDialog));
-
-    if (FAILED(hr))
-    {
-        return hr;
-    }
-
-    // Set the dialog title
-    hr = pSaveDlg->SetTitle(L"Save Kinect Fusion Mesh");
-    if (SUCCEEDED(hr))
-    {
-        // Set the button text
-        hr = pSaveDlg->SetOkButtonLabel (L"Save");
-        if (SUCCEEDED(hr))
-        {
-           
-            if (Obj == saveMeshType)
-            {
-                hr = pSaveDlg->SetFileName(L"MeshedReconstruction.obj");
-            }
-            
-
-            if (SUCCEEDED(hr))
-            {
-                // Set the file type extension
-                if (Obj == saveMeshType)
-                {
-                    hr = pSaveDlg->SetDefaultExtension(L"obj");
-                }
-                
-
-                if (SUCCEEDED(hr))
-                {
-                    // Set the file type filters
-                    if (Obj == saveMeshType)
-                    {
-                        COMDLG_FILTERSPEC allPossibleFileTypes[] = {
-                            { L"Obj mesh files", L"*.obj" },
-                            { L"All files", L"*.*" }
-                        };
-
-                        hr = pSaveDlg->SetFileTypes(
-                            ARRAYSIZE(allPossibleFileTypes),
-                            allPossibleFileTypes );
-                    }
-                    
-
-                    if (SUCCEEDED(hr))
-                    {
-                        // Show the file selection box
-                        hr = pSaveDlg->Show(m_hWnd);
-
-                        // Save the mesh to the chosen file.
-                        if (SUCCEEDED(hr))
-                        {
-                            CComPtr<IShellItem> pItem;
-                            hr = pSaveDlg->GetResult(&pItem);
-
-                            if (SUCCEEDED(hr))
-                            {
-                                LPOLESTR pwsz = nullptr;
-                                hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &pwsz);
-
-                                 if (Obj == saveMeshType)
-                                    {
-                                        hr = WriteAsciiObjMeshFile(pMesh, pwsz);
-                                    }
-                                   
-
-                                    CoTaskMemFree(pwsz);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    
-
-    return hr;
-}*/

@@ -7,6 +7,7 @@
 #include <NuiApi.h>
 #include <NuiKinectFusionApi.h>
 #include<iostream>
+#include "ppl.h"
 using namespace std;
 
 
@@ -16,16 +17,19 @@ class KinectFusionProcessing
 {
 
 	static const int            cBytesPerPixel = 4; // for depth float and int-per-pixel raycast images
-    static const int            cResetOnTimeStampSkippedMilliseconds = 1000;
+    static const int            cResetOnTimeStampSkippedMilliseconds = 2000;
     static const int            cResetOnNumberOfLostFrames = 100;
     static const int            cStatusMessageMaxLen = MAX_PATH*2;
     static const int            cTimeDisplayInterval = 10;
+	static const int			cMinTimestampDifferenceForFrameReSync = 17;
 
 
 public:
 
 	KinectFusionProcessing(void);
 	~KinectFusionProcessing(void);
+
+	
 
 	 /// <summary>
     /// Creates the main window and begins processing
@@ -41,16 +45,27 @@ public:
     INuiSensor*                 m_pNuiSensor;
 
 	NUI_IMAGE_RESOLUTION        m_depthImageResolution;
+	NUI_IMAGE_RESOLUTION        m_colorImageResolution;
+
     int                         m_cDepthWidth;
     int                         m_cDepthHeight;
     int                         m_cDepthImagePixels;
 
+	int                         m_cColorWidth;
+    int                         m_cColorHeight;
+    int                         m_cColorImagePixels;
+
     HANDLE                      m_pDepthStreamHandle;
     HANDLE                      m_hNextDepthFrameEvent;
 
-	LARGE_INTEGER               m_cLastDepthFrameTimeStamp;
+	HANDLE                      m_pColorStreamHandle;
+    HANDLE                      m_hNextColorFrameEvent;
 
-	 /// <summary>
+	LONGLONG                    m_cLastDepthFrameTimeStamp;
+    LONGLONG                    m_cLastColorFrameTimeStamp;
+
+	
+	/// <summary>
     /// Main processing function
     /// </summary>
     void                        Update();
@@ -74,6 +89,18 @@ public:
     HRESULT                     CopyExtendedDepth(NUI_IMAGE_FRAME &imageFrame);
 
 	 /// <summary>
+    /// Copy the color data out of a Kinect image frame
+    /// </summary>
+    /// <returns>S_OK on success, otherwise failure code</returns>
+    HRESULT                     CopyColor(NUI_IMAGE_FRAME &imageFrame);
+
+    /// <summary>
+    /// Adjust color to the same space as depth
+    /// </summary>
+    /// <returns>S_OK on success, otherwise failure code</returns>
+    HRESULT                     MapColorToDepth();
+
+	 /// <summary>
      /// Save Mesh to disk.
      /// </summary>
      /// <param name="mesh">The mesh to save.</param>
@@ -85,17 +112,24 @@ public:
     /// </summary>
     void                        ProcessDepth();
 
+	/// <summary>
+	/// Perform only depth conversion and camera tracking
+	/// </summary>
+	HRESULT						CameraTrackingOnly();
+
     /// <summary>
     /// Reset the reconstruction camera pose and clear the volume.
     /// </summary>
     /// <returns>S_OK on success, otherwise failure code</returns>
     HRESULT                     ResetReconstruction();
 
+	
+
 
 	 /// <summary>
     /// The Kinect Fusion Reconstruction Volume
     /// </summary>
-    INuiFusionReconstruction*   m_pVolume;
+    INuiFusionColorReconstruction*   m_pVolume;
 
     /// <summary>
     /// The Kinect Fusion Volume Parameters
@@ -117,6 +151,18 @@ public:
     /// </summary>
     NUI_DEPTH_IMAGE_PIXEL*      m_pDepthImagePixelBuffer;
     NUI_FUSION_IMAGE_FRAME*     m_pDepthFloatImage;
+
+	 /// <summary>
+    /// For mapping depth to color
+    /// </summary>
+    NUI_FUSION_IMAGE_FRAME*     m_pColorImage;
+    NUI_FUSION_IMAGE_FRAME*     m_pResampledColorImageDepthAligned;
+    NUI_COLOR_IMAGE_POINT*      m_pColorCoordinates;
+    float                       m_colorToDepthDivisor;
+    float                       m_oneOverDepthDivisor;
+    INuiCoordinateMapper*       m_pMapper;
+    bool                        m_bCaptureColor;
+    unsigned int                m_cColorIntegrationInterval;
 
 	/// <summary>
     /// Camera Tracking parameters
